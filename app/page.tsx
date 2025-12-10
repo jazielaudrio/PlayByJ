@@ -3,19 +3,23 @@ import React, { useState, useRef, useEffect } from "react";
 import dynamic from "next/dynamic";
 import { generatePDF } from "@/utils/pdfGenerator";
 import { v4 as uuidv4 } from "uuid";
-import { db, storage } from "@/utils/firebase";
+import { db, storage, auth } from "@/utils/firebase";
 import { 
   collection, 
   addDoc, 
   updateDoc, 
   doc, 
+  getDoc, // <--- Added getDoc
   deleteDoc, 
   onSnapshot, 
   query, 
   orderBy,
-  serverTimestamp
+  serverTimestamp,
+  where 
 } from "firebase/firestore";
 import { ref, uploadString, getDownloadURL, deleteObject } from "firebase/storage";
+import { onAuthStateChanged, signOut } from "firebase/auth";
+import { useRouter } from "next/navigation";
 
 const PlayCanvas = dynamic(() => import("@/components/PlayCanvas"), {
   ssr: false,
@@ -29,13 +33,14 @@ const PlayCanvas = dynamic(() => import("@/components/PlayCanvas"), {
 // Types
 type Player = { id: string; x: number; y: number; color: string; label: string };
 type Route = { id: string; points: number[]; color: string; hasArrow: boolean; isDashed: boolean };
-type Play = { id: string; name: string; image: string }; // image is now a URL
+type Play = { id: string; name: string; image: string };
 
 type Playbook = {
-  id: string; // Firestore Document ID
+  id: string;
   title: string;
   plays: Play[];
   createdAt: any;
+  userId: string;
 };
 
 export default function PlaybookEditor() {
@@ -44,10 +49,13 @@ export default function PlaybookEditor() {
   // Data State
   const [library, setLibrary] = useState<Playbook[]>([]);
   const [currentPlaybook, setCurrentPlaybook] = useState<Playbook | null>(null);
+  const [user, setUser] = useState<any>(null);
+  const [isApproved, setIsApproved] = useState<boolean | null>(null); // <--- New Approval State
   
   // UI State
   const [view, setView] = useState<'editor' | 'library'>('library');
   const [isSaving, setIsSaving] = useState(false);
+  const router = useRouter();
 
   // Editor State
   const [playName, setPlayName] = useState("Untitled Play");
@@ -69,10 +77,44 @@ export default function PlaybookEditor() {
   const [players, setPlayers] = useState<Player[]>(defaultPlayers);
   const [routes, setRoutes] = useState<Route[]>([]);
 
-  // --- FIREBASE SYNC ---
+  // --- AUTH & APPROVAL CHECK ---
   useEffect(() => {
-    // Subscribe to Playbooks Collection
-    const q = query(collection(db, "playbooks"), orderBy("createdAt", "desc"));
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      if (!currentUser) {
+        router.push("/login");
+      } else {
+        setUser(currentUser);
+        
+        // Check Approval Status in Firestore
+        try {
+          const userDocRef = doc(db, "users", currentUser.uid);
+          const userSnap = await getDoc(userDocRef);
+          
+          if (userSnap.exists() && userSnap.data().approved === true) {
+            setIsApproved(true);
+          } else {
+            setIsApproved(false);
+          }
+        } catch (e) {
+          console.error("Error fetching user profile:", e);
+          setIsApproved(false);
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, [router]);
+
+  // --- FIREBASE SYNC (User Specific) ---
+  useEffect(() => {
+    // Only sync if user exists AND is approved
+    if (!user || !isApproved) return;
+
+    const q = query(
+      collection(db, "playbooks"), 
+      where("userId", "==", user.uid),
+      orderBy("createdAt", "desc")
+    );
+
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const books: Playbook[] = snapshot.docs.map(doc => ({
         id: doc.id,
@@ -80,7 +122,6 @@ export default function PlaybookEditor() {
       } as Playbook));
       setLibrary(books);
       
-      // Update current playbook if open
       if (currentPlaybook) {
         const updated = books.find(b => b.id === currentPlaybook.id);
         if (updated) setCurrentPlaybook(updated);
@@ -88,15 +129,18 @@ export default function PlaybookEditor() {
     });
 
     return () => unsubscribe();
-  }, [currentPlaybook?.id]); // Re-run isn't strictly needed for list, but safe
+  }, [user, isApproved, currentPlaybook?.id]); // Added isApproved dependency
 
   // --- ACTIONS ---
 
   const createNewPlaybook = async () => {
+    if (!user) return;
+
     const newBook = { 
       title: "New Playbook", 
       plays: [], 
-      createdAt: serverTimestamp() 
+      createdAt: serverTimestamp(),
+      userId: user.uid
     };
     try {
         const docRef = await addDoc(collection(db, "playbooks"), newBook);
@@ -120,7 +164,6 @@ export default function PlaybookEditor() {
     e.stopPropagation();
     if (confirm("Delete this playbook? This cannot be undone.")) {
       try {
-        // Optional: You should also loop through plays and delete images from Storage here to be clean
         await deleteDoc(doc(db, "playbooks", id));
         if (currentPlaybook?.id === id) setView('library');
       } catch (e) {
@@ -132,11 +175,18 @@ export default function PlaybookEditor() {
   const savePlaybookTitle = async (newTitle: string) => {
     setPlaybookTitle(newTitle);
     if (currentPlaybook) {
-      // Optimistic UI update
       setCurrentPlaybook({ ...currentPlaybook, title: newTitle });
-      // Firestore update
       const bookRef = doc(db, "playbooks", currentPlaybook.id);
       await updateDoc(bookRef, { title: newTitle });
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await signOut(auth);
+      router.push("/login");
+    } catch (e) {
+      console.error("Error signing out:", e);
     }
   };
 
@@ -146,8 +196,6 @@ export default function PlaybookEditor() {
     setIsSaving(true);
 
     try {
-        // 1. Capture Canvas
-        // (Auto-crop logic same as before)
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         
         players.forEach(p => {
@@ -170,21 +218,18 @@ export default function PlaybookEditor() {
         const config = { x, y, width: w, height: h, pixelRatio: 2, mimeType: "image/jpeg", quality: 0.8 };
         const dataUrl = stageRef.current.toDataURL(config);
 
-        // 2. Upload to Firebase Storage
         const playId = uuidv4();
         const storageRef = ref(storage, `plays/${currentPlaybook.id}/${playId}.jpg`);
         
         await uploadString(storageRef, dataUrl, 'data_url');
         const downloadURL = await getDownloadURL(storageRef);
 
-        // 3. Save Metadata to Firestore
         const newPlay: Play = { id: playId, name: playName, image: downloadURL };
         const updatedPlays = [...currentPlaybook.plays, newPlay];
         
         const bookRef = doc(db, "playbooks", currentPlaybook.id);
         await updateDoc(bookRef, { plays: updatedPlays });
 
-        // Reset
         setPlayName(`Play ${updatedPlays.length + 1}`);
         alert("Play Saved!");
     } catch (e) {
@@ -202,14 +247,10 @@ export default function PlaybookEditor() {
         const playToDelete = currentPlaybook.plays.find(p => p.id === playId);
         const updatedPlays = currentPlaybook.plays.filter(p => p.id !== playId);
         
-        // Update DB
         const bookRef = doc(db, "playbooks", currentPlaybook.id);
         await updateDoc(bookRef, { plays: updatedPlays });
 
-        // Delete Image from Storage (Cleanup)
         if (playToDelete) {
-            // Extract path from URL or reconstruct it if predictable
-            // Assuming structure plays/{bookId}/{playId}.jpg
             const imgRef = ref(storage, `plays/${currentPlaybook.id}/${playId}.jpg`);
             deleteObject(imgRef).catch(err => console.log("Image delete warning:", err));
         }
@@ -223,8 +264,44 @@ export default function PlaybookEditor() {
   const deleteRoute = (id: string) => setRoutes(prev => prev.filter(r => r.id !== id));
   const clearRoutes = () => setRoutes([]);
 
-  // --- RENDER ---
+  // --- RENDER STATES ---
 
+  // 1. Loading State (Waiting for Auth or Approval check)
+  if (!user || isApproved === null) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+        <span className="text-gray-400 font-medium animate-pulse">Verifying Access...</span>
+      </div>
+    );
+  }
+
+  // 2. Pending Approval State
+  if (isApproved === false) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 p-6 font-sans">
+        <div className="bg-white p-8 rounded-xl shadow-sm text-center max-w-md border border-gray-200">
+          <div className="text-4xl mb-4">⏳</div>
+          <h1 className="text-xl font-bold text-slate-800 mb-2">Access Pending</h1>
+          <p className="text-gray-600 mb-6 text-sm leading-relaxed">
+            Thanks for signing up! Your account is currently under review by the administrator. 
+            You will be able to create playbooks once approved.
+          </p>
+          <div className="bg-gray-50 p-3 rounded-lg mb-6 border border-gray-100">
+            <p className="text-xs text-gray-400 uppercase font-bold tracking-wide">Registered Email</p>
+            <p className="text-slate-700 font-mono text-sm mt-1">{user.email}</p>
+          </div>
+          <button 
+            onClick={handleSignOut}
+            className="text-red-500 font-bold text-sm hover:text-red-600 hover:underline transition"
+          >
+            Sign Out & Check Later
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // 3. Approved State (Main App)
   if (view === 'library') {
     return (
       <div className="min-h-screen bg-slate-50 p-8 font-sans">
@@ -234,9 +311,18 @@ export default function PlaybookEditor() {
               <h1 className="text-4xl font-extrabold text-slate-900">My Playbooks</h1>
               <p className="text-slate-500 mt-2">Manage your team's strategies.</p>
             </div>
-            <button onClick={createNewPlaybook} className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg shadow-lg font-bold transition flex items-center gap-2">
-              + New Playbook
-            </button>
+            <div className="flex items-center gap-4">
+               <div className="text-right hidden sm:block">
+                 <p className="text-xs text-gray-400 font-bold uppercase">Logged in as</p>
+                 <p className="text-sm text-gray-700 font-medium">{user.email}</p>
+               </div>
+               <button onClick={handleSignOut} className="text-gray-400 hover:text-red-500 font-bold text-sm px-3 py-2">
+                 Sign Out
+               </button>
+               <button onClick={createNewPlaybook} className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg shadow-lg font-bold transition flex items-center gap-2">
+                 + New Playbook
+               </button>
+            </div>
           </header>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {library.map((book) => (
@@ -270,7 +356,6 @@ export default function PlaybookEditor() {
           </div>
         </div>
         <div className="flex gap-3">
-          {/* Note: generatePDF is async now */}
           <button onClick={() => generatePDF(currentPlaybook?.plays || [], 'sheet')} className="bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 px-4 py-2 rounded-lg shadow-sm font-medium transition flex items-center gap-2"><span>📄</span> A4 Sheet</button>
           <button onClick={() => generatePDF(currentPlaybook?.plays || [], 'wristband')} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-lg shadow-sm font-medium transition flex items-center gap-2"><span>⌚</span> Wristband</button>
         </div>
