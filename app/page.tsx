@@ -9,7 +9,6 @@ import {
   addDoc, 
   updateDoc, 
   doc, 
-  getDoc, // <--- Added getDoc
   deleteDoc, 
   onSnapshot, 
   query, 
@@ -50,7 +49,7 @@ export default function PlaybookEditor() {
   const [library, setLibrary] = useState<Playbook[]>([]);
   const [currentPlaybook, setCurrentPlaybook] = useState<Playbook | null>(null);
   const [user, setUser] = useState<any>(null);
-  const [isApproved, setIsApproved] = useState<boolean | null>(null); // <--- New Approval State
+  const [isApproved, setIsApproved] = useState<boolean | null>(null);
   
   // UI State
   const [view, setView] = useState<'editor' | 'library'>('library');
@@ -77,34 +76,55 @@ export default function PlaybookEditor() {
   const [players, setPlayers] = useState<Player[]>(defaultPlayers);
   const [routes, setRoutes] = useState<Route[]>([]);
 
-  // --- AUTH & APPROVAL CHECK ---
+  // --- AUTH, APPROVAL & SESSION SECURITY CHECK ---
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+    let unsubscribeUserDoc: () => void;
+
+    const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
       if (!currentUser) {
         router.push("/login");
       } else {
         setUser(currentUser);
         
-        // Check Approval Status in Firestore
-        try {
-          const userDocRef = doc(db, "users", currentUser.uid);
-          const userSnap = await getDoc(userDocRef);
-          
-          if (userSnap.exists() && userSnap.data().approved === true) {
-            setIsApproved(true);
-          } else {
-            setIsApproved(false);
-          }
-        } catch (e) {
-          console.error("Error fetching user profile:", e);
-          setIsApproved(false);
-        }
+        // Real-time listener for User Profile
+        const userDocRef = doc(db, "users", currentUser.uid);
+        
+        unsubscribeUserDoc = onSnapshot(userDocRef, (docSnap) => {
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                
+                // 1. Check Approval (Auto-updates if admin approves)
+                setIsApproved(data.approved === true);
+
+                // 2. Check Session ID (Anti-Sharing Security)
+                const dbSessionId = data.currentSessionId;
+                const localSessionId = localStorage.getItem("playmaker_session_id");
+
+                // If DB has a session ID (it should), but it doesn't match ours -> KICK OUT
+                if (dbSessionId && localSessionId && dbSessionId !== localSessionId) {
+                    alert("Security Alert: Your account was logged in on another device. You have been signed out.");
+                    signOut(auth).then(() => {
+                        router.push("/login");
+                    });
+                }
+            } else {
+                // User doc missing (rare) or deleted
+                setIsApproved(false); 
+            }
+        }, (error) => {
+            console.error("Error listening to user profile:", error);
+        });
       }
     });
-    return () => unsubscribe();
+
+    // Cleanup listeners
+    return () => {
+        unsubscribeAuth();
+        if (unsubscribeUserDoc) unsubscribeUserDoc();
+    };
   }, [router]);
 
-  // --- FIREBASE SYNC (User Specific) ---
+  // --- FIREBASE SYNC (User Specific Playbooks) ---
   useEffect(() => {
     // Only sync if user exists AND is approved
     if (!user || !isApproved) return;
@@ -129,7 +149,7 @@ export default function PlaybookEditor() {
     });
 
     return () => unsubscribe();
-  }, [user, isApproved, currentPlaybook?.id]); // Added isApproved dependency
+  }, [user, isApproved, currentPlaybook?.id]);
 
   // --- ACTIONS ---
 
