@@ -14,7 +14,8 @@ import {
   query, 
   orderBy,
   serverTimestamp,
-  where 
+  where,
+  getDoc
 } from "firebase/firestore";
 import { ref, uploadString, getDownloadURL, deleteObject } from "firebase/storage";
 import { onAuthStateChanged, signOut } from "firebase/auth";
@@ -49,11 +50,11 @@ export default function PlaybookEditor() {
   const [library, setLibrary] = useState<Playbook[]>([]);
   const [currentPlaybook, setCurrentPlaybook] = useState<Playbook | null>(null);
   const [user, setUser] = useState<any>(null);
-  const [isApproved, setIsApproved] = useState<boolean | null>(null); 
+  const [isApproved, setIsApproved] = useState<boolean | null>(null);
   
   // UI State
   const [view, setView] = useState<'editor' | 'library'>('library');
-  const [isSaving, setIsSaving] = useState(false);
+  const [isSaving, setIsSaving] = useState(false); // <--- FIXED: Re-added this
   const router = useRouter();
 
   // Editor State
@@ -76,7 +77,7 @@ export default function PlaybookEditor() {
   const [players, setPlayers] = useState<Player[]>(defaultPlayers);
   const [routes, setRoutes] = useState<Route[]>([]);
 
-  // --- AUTH, APPROVAL & SESSION SECURITY CHECK ---
+  // --- AUTH CHECK ---
   useEffect(() => {
     let unsubscribeUserDoc: () => void;
 
@@ -92,26 +93,18 @@ export default function PlaybookEditor() {
         unsubscribeUserDoc = onSnapshot(userDocRef, (docSnap) => {
             if (docSnap.exists()) {
                 const data = docSnap.data();
-                
-                // 1. Check Approval (Auto-updates if admin approves)
                 setIsApproved(data.approved === true);
 
-                // 2. Check Session ID (Anti-Sharing Security)
                 const dbSessionId = data.currentSessionId;
                 const localSessionId = localStorage.getItem("playmaker_session_id");
 
-                // If DB has a session ID, but it doesn't match ours -> KICK OUT
                 if (dbSessionId && localSessionId && dbSessionId !== localSessionId) {
                     alert("Security Alert: Your account was logged in on another device. You have been signed out.");
-                    signOut(auth).then(() => {
-                        router.push("/login");
-                    });
+                    signOut(auth).then(() => router.push("/login"));
                 }
             } else {
                 setIsApproved(false); 
             }
-        }, (error) => {
-            console.error("Error listening to user profile:", error);
         });
       }
     });
@@ -122,7 +115,7 @@ export default function PlaybookEditor() {
     };
   }, [router]);
 
-  // --- FIREBASE SYNC (User Specific) ---
+  // --- FIREBASE SYNC ---
   useEffect(() => {
     if (!user || !isApproved) return;
 
@@ -152,7 +145,6 @@ export default function PlaybookEditor() {
 
   const createNewPlaybook = async () => {
     if (!user) return;
-
     const newBook = { 
       title: "New Playbook", 
       plays: [], 
@@ -179,13 +171,9 @@ export default function PlaybookEditor() {
 
   const deletePlaybook = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (confirm("Delete this playbook? This cannot be undone.")) {
-      try {
-        await deleteDoc(doc(db, "playbooks", id));
-        if (currentPlaybook?.id === id) setView('library');
-      } catch (e) {
-        console.error("Error deleting playbook: ", e);
-      }
+    if (confirm("Delete this playbook?")) {
+      await deleteDoc(doc(db, "playbooks", id));
+      if (currentPlaybook?.id === id) setView('library');
     }
   };
 
@@ -199,19 +187,18 @@ export default function PlaybookEditor() {
   };
 
   const handleSignOut = async () => {
-    try {
-      await signOut(auth);
-      router.push("/login");
-    } catch (e) {
-      console.error("Error signing out:", e);
-    }
+    await signOut(auth);
+    router.push("/login");
   };
 
-  // --- OPTIMIZED SAVE PLAY (Instant Feedback) ---
+  // --- FAST SAVE & FIX BLACK BG ---
   const savePlaySnapshot = async () => {
     if (!stageRef.current || !currentPlaybook) return;
     
-    // 1. Capture Canvas (Reduced Quality for Speed)
+    // Briefly block button to prevent double-click during capture
+    setIsSaving(true); 
+
+    // 1. Capture Canvas (Auto-Crop)
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     
     players.forEach(p => {
@@ -231,11 +218,12 @@ export default function PlaybookEditor() {
     let w = (maxX - minX) + (PADDING * 2), h = (maxY - minY) + (PADDING * 2);
     if (x < 0) { w += x; x = 0; } if (y < 0) { h += y; y = 0; }
 
-    // Optimization: pixelRatio 1 instead of 2 cuts file size by ~75%
-    const config = { x, y, width: w, height: h, pixelRatio: 1, mimeType: "image/jpeg", quality: 0.7 };
+    // FIXED: Use "image/png" to preserve transparency (no black background)
+    // Quality isn't used for PNG, but pixelRatio helps resolution
+    const config = { x, y, width: w, height: h, pixelRatio: 1.5, mimeType: "image/png" };
     const dataUrl = stageRef.current.toDataURL(config);
 
-    // 2. OPTIMISTIC UPDATE (Show Immediately)
+    // 2. OPTIMISTIC UPDATE (Instant Feedback)
     const playId = uuidv4();
     const tempPlay: Play = { id: playId, name: playName, image: dataUrl };
     
@@ -243,47 +231,41 @@ export default function PlaybookEditor() {
     setCurrentPlaybook({ ...currentPlaybook, plays: optimisticPlays });
     setPlayName(`Play ${optimisticPlays.length + 1}`);
     
-    // UI Feedback is immediate, we don't block interaction
-    // setIsSaving(true); // removed to allow rapid creation
+    // Unlock UI immediately so it feels fast
+    setIsSaving(false); 
 
     // 3. BACKGROUND UPLOAD
     try {
-        const storageRef = ref(storage, `plays/${currentPlaybook.id}/${playId}.jpg`);
+        const storageRef = ref(storage, `plays/${currentPlaybook.id}/${playId}.png`);
         await uploadString(storageRef, dataUrl, 'data_url');
         const downloadURL = await getDownloadURL(storageRef);
 
-        // Update DB with Real URL
+        // Update DB with Real URL silently
         const finalPlay = { ...tempPlay, image: downloadURL };
         const bookRef = doc(db, "playbooks", currentPlaybook.id);
         
-        // We use the optimistic list but replace the temp entry with the final one
         await updateDoc(bookRef, { 
             plays: optimisticPlays.map(p => p.id === playId ? finalPlay : p) 
         });
 
     } catch (e) {
         console.error("Background save failed:", e);
-        alert("Error saving to cloud. Please check connection.");
-        // Revert could be handled here, but simplest is to let user try again
+        // Silent fail or toast could go here
     }
   };
 
   const deletePlay = async (playId: string) => {
     if (!currentPlaybook) return;
     if (confirm("Delete this play?")) {
-      try {
-        const playToDelete = currentPlaybook.plays.find(p => p.id === playId);
-        const updatedPlays = currentPlaybook.plays.filter(p => p.id !== playId);
-        
-        const bookRef = doc(db, "playbooks", currentPlaybook.id);
-        await updateDoc(bookRef, { plays: updatedPlays });
+      const playToDelete = currentPlaybook.plays.find(p => p.id === playId);
+      const updatedPlays = currentPlaybook.plays.filter(p => p.id !== playId);
+      
+      const bookRef = doc(db, "playbooks", currentPlaybook.id);
+      await updateDoc(bookRef, { plays: updatedPlays });
 
-        if (playToDelete) {
-            const imgRef = ref(storage, `plays/${currentPlaybook.id}/${playId}.jpg`);
-            deleteObject(imgRef).catch(err => console.log("Image delete warning:", err));
-        }
-      } catch (e) {
-        console.error("Error deleting play:", e);
+      if (playToDelete) {
+          const imgRef = ref(storage, `plays/${currentPlaybook.id}/${playId}.png`);
+          deleteObject(imgRef).catch(() => {});
       }
     }
   };
@@ -309,14 +291,13 @@ export default function PlaybookEditor() {
           <div className="text-4xl mb-4">⏳</div>
           <h1 className="text-xl font-bold text-slate-800 mb-2">Access Pending</h1>
           <p className="text-gray-600 mb-6 text-sm leading-relaxed">
-            Thanks for signing up! Your account is currently under review by the administrator. 
-            You will be able to create playbooks once approved.
+            Thanks for signing up! Your account is currently under review.
           </p>
           <div className="bg-gray-50 p-3 rounded-lg mb-6 border border-gray-100">
             <p className="text-xs text-gray-400 uppercase font-bold tracking-wide">Registered Email</p>
             <p className="text-slate-700 font-mono text-sm mt-1">{user.email}</p>
           </div>
-          <button onClick={handleSignOut} className="text-red-500 font-bold text-sm hover:text-red-600 hover:underline transition">
+          <button onClick={handleSignOut} className="text-red-500 font-bold text-sm hover:underline">
             Sign Out & Check Later
           </button>
         </div>
@@ -403,8 +384,8 @@ export default function PlaybookEditor() {
               <button onClick={undoLastRoute} className="bg-yellow-50 text-yellow-700 py-2 rounded text-xs font-bold hover:bg-yellow-100">Undo</button>
               <button onClick={clearRoutes} className="bg-red-50 text-red-700 py-2 rounded text-xs font-bold hover:bg-red-100">Clear</button>
             </div>
-            <button onClick={savePlaySnapshot} className="w-full bg-slate-900 text-white py-3 rounded-lg hover:bg-slate-800 font-bold shadow-md mt-2">
-              + Add to Playbook
+            <button onClick={savePlaySnapshot} disabled={isSaving} className="w-full bg-slate-900 text-white py-3 rounded-lg hover:bg-slate-800 font-bold shadow-md mt-2 disabled:opacity-50">
+              {isSaving ? "Saving..." : "+ Add to Playbook"}
             </button>
           </div>
 
