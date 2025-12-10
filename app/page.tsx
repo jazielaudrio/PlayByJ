@@ -49,7 +49,7 @@ export default function PlaybookEditor() {
   const [library, setLibrary] = useState<Playbook[]>([]);
   const [currentPlaybook, setCurrentPlaybook] = useState<Playbook | null>(null);
   const [user, setUser] = useState<any>(null);
-  const [isApproved, setIsApproved] = useState<boolean | null>(null);
+  const [isApproved, setIsApproved] = useState<boolean | null>(null); 
   
   // UI State
   const [view, setView] = useState<'editor' | 'library'>('library');
@@ -100,7 +100,7 @@ export default function PlaybookEditor() {
                 const dbSessionId = data.currentSessionId;
                 const localSessionId = localStorage.getItem("playmaker_session_id");
 
-                // If DB has a session ID (it should), but it doesn't match ours -> KICK OUT
+                // If DB has a session ID, but it doesn't match ours -> KICK OUT
                 if (dbSessionId && localSessionId && dbSessionId !== localSessionId) {
                     alert("Security Alert: Your account was logged in on another device. You have been signed out.");
                     signOut(auth).then(() => {
@@ -108,7 +108,6 @@ export default function PlaybookEditor() {
                     });
                 }
             } else {
-                // User doc missing (rare) or deleted
                 setIsApproved(false); 
             }
         }, (error) => {
@@ -117,16 +116,14 @@ export default function PlaybookEditor() {
       }
     });
 
-    // Cleanup listeners
     return () => {
         unsubscribeAuth();
         if (unsubscribeUserDoc) unsubscribeUserDoc();
     };
   }, [router]);
 
-  // --- FIREBASE SYNC (User Specific Playbooks) ---
+  // --- FIREBASE SYNC (User Specific) ---
   useEffect(() => {
-    // Only sync if user exists AND is approved
     if (!user || !isApproved) return;
 
     const q = query(
@@ -210,53 +207,64 @@ export default function PlaybookEditor() {
     }
   };
 
-  // --- SAVE PLAY (WITH IMAGE UPLOAD) ---
+  // --- OPTIMIZED SAVE PLAY (Instant Feedback) ---
   const savePlaySnapshot = async () => {
     if (!stageRef.current || !currentPlaybook) return;
-    setIsSaving(true);
+    
+    // 1. Capture Canvas (Reduced Quality for Speed)
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    
+    players.forEach(p => {
+        if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
+    });
+    routes.forEach(r => {
+        for (let i = 0; i < r.points.length; i += 2) {
+            const x = r.points[i], y = r.points[i + 1];
+            if (x < minX) minX = x; if (y < minY) minY = y;
+            if (x > maxX) maxX = x; if (y > maxY) maxY = y;
+        }
+    });
+    if (minX === Infinity) { minX = 0; minY = 0; maxX = 800; maxY = 500; }
+    const PADDING = 30;
+    let x = minX - PADDING, y = minY - PADDING;
+    let w = (maxX - minX) + (PADDING * 2), h = (maxY - minY) + (PADDING * 2);
+    if (x < 0) { w += x; x = 0; } if (y < 0) { h += y; y = 0; }
 
+    // Optimization: pixelRatio 1 instead of 2 cuts file size by ~75%
+    const config = { x, y, width: w, height: h, pixelRatio: 1, mimeType: "image/jpeg", quality: 0.7 };
+    const dataUrl = stageRef.current.toDataURL(config);
+
+    // 2. OPTIMISTIC UPDATE (Show Immediately)
+    const playId = uuidv4();
+    const tempPlay: Play = { id: playId, name: playName, image: dataUrl };
+    
+    const optimisticPlays = [...currentPlaybook.plays, tempPlay];
+    setCurrentPlaybook({ ...currentPlaybook, plays: optimisticPlays });
+    setPlayName(`Play ${optimisticPlays.length + 1}`);
+    
+    // UI Feedback is immediate, we don't block interaction
+    // setIsSaving(true); // removed to allow rapid creation
+
+    // 3. BACKGROUND UPLOAD
     try {
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        
-        players.forEach(p => {
-            if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y;
-            if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
-        });
-        routes.forEach(r => {
-            for (let i = 0; i < r.points.length; i += 2) {
-                const x = r.points[i], y = r.points[i + 1];
-                if (x < minX) minX = x; if (y < minY) minY = y;
-                if (x > maxX) maxX = x; if (y > maxY) maxY = y;
-            }
-        });
-        if (minX === Infinity) { minX = 0; minY = 0; maxX = 800; maxY = 500; }
-        const PADDING = 30;
-        let x = minX - PADDING, y = minY - PADDING;
-        let w = (maxX - minX) + (PADDING * 2), h = (maxY - minY) + (PADDING * 2);
-        if (x < 0) { w += x; x = 0; } if (y < 0) { h += y; y = 0; }
-
-        const config = { x, y, width: w, height: h, pixelRatio: 2, mimeType: "image/jpeg", quality: 0.8 };
-        const dataUrl = stageRef.current.toDataURL(config);
-
-        const playId = uuidv4();
         const storageRef = ref(storage, `plays/${currentPlaybook.id}/${playId}.jpg`);
-        
         await uploadString(storageRef, dataUrl, 'data_url');
         const downloadURL = await getDownloadURL(storageRef);
 
-        const newPlay: Play = { id: playId, name: playName, image: downloadURL };
-        const updatedPlays = [...currentPlaybook.plays, newPlay];
-        
+        // Update DB with Real URL
+        const finalPlay = { ...tempPlay, image: downloadURL };
         const bookRef = doc(db, "playbooks", currentPlaybook.id);
-        await updateDoc(bookRef, { plays: updatedPlays });
+        
+        // We use the optimistic list but replace the temp entry with the final one
+        await updateDoc(bookRef, { 
+            plays: optimisticPlays.map(p => p.id === playId ? finalPlay : p) 
+        });
 
-        setPlayName(`Play ${updatedPlays.length + 1}`);
-        alert("Play Saved!");
     } catch (e) {
-        console.error("Error saving play: ", e);
-        alert("Failed to save play. Check console.");
-    } finally {
-        setIsSaving(false);
+        console.error("Background save failed:", e);
+        alert("Error saving to cloud. Please check connection.");
+        // Revert could be handled here, but simplest is to let user try again
     }
   };
 
@@ -286,7 +294,6 @@ export default function PlaybookEditor() {
 
   // --- RENDER STATES ---
 
-  // 1. Loading State (Waiting for Auth or Approval check)
   if (!user || isApproved === null) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gray-50">
@@ -295,7 +302,6 @@ export default function PlaybookEditor() {
     );
   }
 
-  // 2. Pending Approval State
   if (isApproved === false) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 p-6 font-sans">
@@ -310,10 +316,7 @@ export default function PlaybookEditor() {
             <p className="text-xs text-gray-400 uppercase font-bold tracking-wide">Registered Email</p>
             <p className="text-slate-700 font-mono text-sm mt-1">{user.email}</p>
           </div>
-          <button 
-            onClick={handleSignOut}
-            className="text-red-500 font-bold text-sm hover:text-red-600 hover:underline transition"
-          >
+          <button onClick={handleSignOut} className="text-red-500 font-bold text-sm hover:text-red-600 hover:underline transition">
             Sign Out & Check Later
           </button>
         </div>
@@ -321,7 +324,6 @@ export default function PlaybookEditor() {
     );
   }
 
-  // 3. Approved State (Main App)
   if (view === 'library') {
     return (
       <div className="min-h-screen bg-slate-50 p-8 font-sans">
@@ -401,8 +403,8 @@ export default function PlaybookEditor() {
               <button onClick={undoLastRoute} className="bg-yellow-50 text-yellow-700 py-2 rounded text-xs font-bold hover:bg-yellow-100">Undo</button>
               <button onClick={clearRoutes} className="bg-red-50 text-red-700 py-2 rounded text-xs font-bold hover:bg-red-100">Clear</button>
             </div>
-            <button onClick={savePlaySnapshot} disabled={isSaving} className="w-full bg-slate-900 text-white py-3 rounded-lg hover:bg-slate-800 font-bold shadow-md mt-2 disabled:opacity-50">
-              {isSaving ? "Saving..." : "+ Add to Playbook"}
+            <button onClick={savePlaySnapshot} className="w-full bg-slate-900 text-white py-3 rounded-lg hover:bg-slate-800 font-bold shadow-md mt-2">
+              + Add to Playbook
             </button>
           </div>
 
