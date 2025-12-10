@@ -12,28 +12,38 @@ export default function LoginPage() {
   const [error, setError] = useState("");
   const router = useRouter();
 
-  const handleAuth = async (e: React.FormEvent) => {
+const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
     
     try {
       if (isSignUp) {
+        console.log("Starting sign up...");
+        
         // 1. Create Authentication User
         const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        console.log("Auth successful for:", userCredential.user.uid);
         
-        // 2. Create User Document in Firestore with approved: false
-        await setDoc(doc(db, "users", userCredential.user.uid), {
-          email: email,
-          approved: false, // <--- THE KEY FLAG
-          createdAt: new Date().toISOString()
-        });
+        // 2. Create User Document
+        try {
+            await setDoc(doc(db, "users", userCredential.user.uid), {
+              email: email,
+              approved: false,
+              createdAt: new Date().toISOString()
+            });
+            console.log("Database document created!");
+        } catch (dbError: any) {
+            console.error("Database Save Error:", dbError);
+            setError("Account created, but database failed: " + dbError.message);
+            return; // Stop here so we see the error
+        }
         
       } else {
-        // Log In
         await signInWithEmailAndPassword(auth, email, password);
       }
       router.push("/"); 
     } catch (err: any) {
+      console.error("Auth Error:", err);
       setError(err.message.replace("Firebase: ", ""));
     }
   };
