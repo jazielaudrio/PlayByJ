@@ -29,9 +29,10 @@ const PlayCanvas = dynamic(() => import("@/components/PlayCanvas"), {
   ),
 });
 
+// Types
 type Player = { id: string; x: number; y: number; color: string; label: string };
 type Route = { id: string; points: number[]; color: string; hasArrow: boolean; isDashed: boolean };
-type Play = { id: string; name: string; image: string };
+type Play = { id: string; name: string; image: string; status?: 'syncing' | 'saved' | 'error' };
 
 type Playbook = {
   id: string;
@@ -43,20 +44,24 @@ type Playbook = {
 export default function PlaybookEditor() {
   const stageRef = useRef<any>(null);
   
+  // Data State
   const [library, setLibrary] = useState<Playbook[]>([]);
   const [currentPlaybook, setCurrentPlaybook] = useState<Playbook | null>(null);
   const [currentPlays, setCurrentPlays] = useState<Play[]>([]); 
   const [user, setUser] = useState<any>(null);
   const [isApproved, setIsApproved] = useState<boolean | null>(null);
   
+  // UI State
   const [view, setView] = useState<'editor' | 'library'>('library');
   const [isSaving, setIsSaving] = useState(false);
   const router = useRouter();
 
+  // Editor State
   const [playName, setPlayName] = useState("Untitled Play");
   const [playbookTitle, setPlaybookTitle] = useState("My Playbook");
   const [titleSavingStatus, setTitleSavingStatus] = useState<'saved' | 'saving'>('saved');
   
+  // Tools State
   const [drawMode, setDrawMode] = useState<'free' | 'straight'>('free');
   const [hasArrow, setHasArrow] = useState(true);
   const [isDashed, setIsDashed] = useState(false);
@@ -75,18 +80,22 @@ export default function PlaybookEditor() {
   // --- 1. AUTH CHECK ---
   useEffect(() => {
     let unsubscribeUserDoc: () => void;
+
     const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
       if (!currentUser) {
         router.push("/login");
       } else {
         setUser(currentUser);
+        
         const userDocRef = doc(db, "users", currentUser.uid);
         unsubscribeUserDoc = onSnapshot(userDocRef, (docSnap) => {
             if (docSnap.exists()) {
                 const data = docSnap.data();
                 setIsApproved(data.approved === true);
+
                 const dbSessionId = data.currentSessionId;
                 const localSessionId = localStorage.getItem("playmaker_session_id");
+
                 if (dbSessionId && localSessionId && dbSessionId !== localSessionId) {
                     alert("Security Alert: Your account was logged in on another device. You have been signed out.");
                     signOut(auth).then(() => router.push("/login"));
@@ -97,6 +106,7 @@ export default function PlaybookEditor() {
         });
       }
     });
+
     return () => {
         unsubscribeAuth();
         if (unsubscribeUserDoc) unsubscribeUserDoc();
@@ -106,11 +116,13 @@ export default function PlaybookEditor() {
   // --- 2. FETCH PLAYBOOKS ---
   useEffect(() => {
     if (!user || !isApproved) return;
+
     const q = query(
       collection(db, "playbooks"), 
       where("userId", "==", user.uid),
       orderBy("createdAt", "desc")
     );
+
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const books: Playbook[] = snapshot.docs.map(doc => ({
         id: doc.id,
@@ -125,40 +137,40 @@ export default function PlaybookEditor() {
         }
       }
     });
+
     return () => unsubscribe();
   }, [user, isApproved, currentPlaybook?.id]);
 
-  // --- 3. FETCH PLAYS (Secure Listener) ---
+  // --- 3. FETCH PLAYS (Real-time) ---
   useEffect(() => {
-    // Only listen if we have a valid user AND a valid playbook open
-    if (!currentPlaybook || !user) return;
+    if (!currentPlaybook) return;
 
     const playsRef = collection(db, "playbooks", currentPlaybook.id, "plays");
     const q = query(playsRef, orderBy("createdAt", "asc"));
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
-        const fetchedPlays: Play[] = snapshot.docs.map(doc => ({
-            id: doc.id,
-            ...doc.data()
-        } as Play));
+        const fetchedPlays: Play[] = snapshot.docs.map(doc => {
+            const data = doc.data();
+            return {
+                id: doc.id,
+                name: data.name,
+                image: data.image,
+                status: 'saved' 
+            };
+        });
         setCurrentPlays(fetchedPlays);
-    }, (error) => {
-        console.error("Plays Listener Error:", error);
-        // If permission denied happens (e.g. parent deleted), force close editor
-        if (error.code === 'permission-denied') {
-            setView('library');
-            setCurrentPlaybook(null);
-        }
     });
 
     return () => unsubscribe();
-  }, [currentPlaybook?.id, user]); // Added user dependency
+  }, [currentPlaybook?.id]);
 
   // --- 4. AUTO-SAVE TITLE ---
   useEffect(() => {
     if (!currentPlaybook || !playbookTitle) return;
     if (playbookTitle === currentPlaybook.title) return;
+
     setTitleSavingStatus('saving');
+    
     const handler = setTimeout(async () => {
         try {
             const bookRef = doc(db, "playbooks", currentPlaybook.id);
@@ -169,8 +181,11 @@ export default function PlaybookEditor() {
             setTitleSavingStatus('saved'); 
         }
     }, 1000); 
+
     return () => clearTimeout(handler);
   }, [playbookTitle, currentPlaybook]);
+
+  // --- ACTIONS ---
 
   const createNewPlaybook = async () => {
     if (!user) return;
@@ -198,21 +213,18 @@ export default function PlaybookEditor() {
     setCurrentPlays([]); 
   };
 
+  // --- NEW FUNCTION: Correctly Close Editor ---
+  const closeEditor = () => {
+    setView('library');
+    setCurrentPlaybook(null); // <--- THIS FIXES THE BUG!
+    setCurrentPlays([]);
+  };
+
   const deletePlaybook = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (confirm("Delete this playbook?")) {
-      // 1. Unmount editor immediately to kill listener
-      if (currentPlaybook?.id === id) {
-          setView('library');
-          setCurrentPlaybook(null);
-      }
-      
-      // 2. Delete from DB
-      try {
-          await deleteDoc(doc(db, "playbooks", id));
-      } catch (err) {
-          console.error("Delete failed:", err);
-      }
+      await deleteDoc(doc(db, "playbooks", id));
+      if (currentPlaybook?.id === id) closeEditor(); // Use new close function
     }
   };
 
@@ -250,30 +262,48 @@ export default function PlaybookEditor() {
     const config = { x, y, width: w, height: h, pixelRatio: 1.5, mimeType: "image/png" };
     const dataUrl = stageRef.current.toDataURL(config);
 
+    const playId = uuidv4();
+    const tempPlay: Play = { 
+        id: playId, 
+        name: playName, 
+        image: dataUrl,
+        status: 'syncing' 
+    };
+
+    setCurrentPlays(prev => [...prev, tempPlay]);
+    setPlayName(`Play ${currentPlays.length + 2}`); 
+    setIsSaving(false); 
+
     try {
         const playsCollectionRef = collection(db, "playbooks", currentPlaybook.id, "plays");
         await addDoc(playsCollectionRef, {
-            name: playName,
+            name: tempPlay.name,
             image: dataUrl,
             createdAt: serverTimestamp()
         });
-        setPlayName(`Play ${currentPlays.length + 2}`);
-    } catch (e) {
+    } catch (e: any) {
         console.error("Save failed:", e);
-        alert("Failed to save play.");
-    } finally {
-        setIsSaving(false);
+        setCurrentPlays(prev => prev.map(p => p.id === playId ? { ...p, status: 'error' } : p));
+        
+        if (e.code === 'resource-exhausted') {
+            alert("Error: Play image is too large. Try drawing less.");
+        } else {
+            alert("Failed to save play to cloud.");
+        }
     }
   };
 
   const deletePlay = async (playId: string) => {
     if (!currentPlaybook) return;
     if (confirm("Delete this play?")) {
+      setCurrentPlays(prev => prev.filter(p => p.id !== playId));
+
       try {
         const playDocRef = doc(db, "playbooks", currentPlaybook.id, "plays", playId);
         await deleteDoc(playDocRef);
       } catch (e) {
         console.error("Error deleting play:", e);
+        alert("Failed to delete form cloud.");
       }
     }
   };
@@ -281,6 +311,8 @@ export default function PlaybookEditor() {
   const undoLastRoute = () => setRoutes(prev => prev.slice(0, -1));
   const deleteRoute = (id: string) => setRoutes(prev => prev.filter(r => r.id !== id));
   const clearRoutes = () => setRoutes([]);
+
+  // --- RENDER ---
 
   if (!user || isApproved === null) {
     return (
@@ -349,7 +381,8 @@ export default function PlaybookEditor() {
     <div className="min-h-screen bg-gray-50 p-6 font-sans text-gray-800">
       <header className="flex flex-col md:flex-row justify-between items-center mb-6 gap-4">
         <div className="flex items-center gap-4">
-          <button onClick={() => setView('library')} className="text-gray-500 hover:text-blue-600 font-bold text-sm flex items-center gap-1">← Library</button>
+          {/* UPDATED BACK BUTTON: Calls closeEditor() */}
+          <button onClick={closeEditor} className="text-gray-500 hover:text-blue-600 font-bold text-sm flex items-center gap-1">← Library</button>
           <div className="h-8 w-[1px] bg-gray-300 mx-2"></div>
           <div>
             <div className="flex items-center gap-2">
@@ -398,6 +431,8 @@ export default function PlaybookEditor() {
                   <div className="flex items-center gap-3 overflow-hidden">
                     <span className="text-gray-400 font-mono text-xs">{idx + 1}</span>
                     <span className="text-sm font-medium truncate w-24">{p.name}</span>
+                    {p.status === 'syncing' && <span className="text-[10px] text-blue-500 animate-pulse">Sync...</span>}
+                    {p.status === 'error' && <span className="text-[10px] text-red-500">Failed</span>}
                   </div>
                   <div className="flex items-center gap-2">
                     <img src={p.image} className="w-8 h-5 object-cover border rounded bg-white" />
