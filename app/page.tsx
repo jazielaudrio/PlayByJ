@@ -3,7 +3,7 @@ import React, { useState, useRef, useEffect } from "react";
 import dynamic from "next/dynamic";
 import { generatePDF } from "@/utils/pdfGenerator";
 import { v4 as uuidv4 } from "uuid";
-import { db, storage, auth } from "@/utils/firebase";
+import { db, auth } from "@/utils/firebase"; 
 import { 
   collection, 
   addDoc, 
@@ -17,7 +17,6 @@ import {
   where,
   getDoc
 } from "firebase/firestore";
-import { ref, uploadString, getDownloadURL, deleteObject } from "firebase/storage";
 import { onAuthStateChanged, signOut } from "firebase/auth";
 import { useRouter } from "next/navigation";
 
@@ -30,7 +29,6 @@ const PlayCanvas = dynamic(() => import("@/components/PlayCanvas"), {
   ),
 });
 
-// Types
 type Player = { id: string; x: number; y: number; color: string; label: string };
 type Route = { id: string; points: number[]; color: string; hasArrow: boolean; isDashed: boolean };
 type Play = { id: string; name: string; image: string };
@@ -38,7 +36,6 @@ type Play = { id: string; name: string; image: string };
 type Playbook = {
   id: string;
   title: string;
-  plays: Play[];
   createdAt: any;
   userId: string;
 };
@@ -46,22 +43,20 @@ type Playbook = {
 export default function PlaybookEditor() {
   const stageRef = useRef<any>(null);
   
-  // Data State
   const [library, setLibrary] = useState<Playbook[]>([]);
   const [currentPlaybook, setCurrentPlaybook] = useState<Playbook | null>(null);
+  const [currentPlays, setCurrentPlays] = useState<Play[]>([]); 
   const [user, setUser] = useState<any>(null);
   const [isApproved, setIsApproved] = useState<boolean | null>(null);
   
-  // UI State
   const [view, setView] = useState<'editor' | 'library'>('library');
-  const [isSaving, setIsSaving] = useState(false); // <--- FIXED: Re-added this
+  const [isSaving, setIsSaving] = useState(false);
   const router = useRouter();
 
-  // Editor State
   const [playName, setPlayName] = useState("Untitled Play");
   const [playbookTitle, setPlaybookTitle] = useState("My Playbook");
+  const [titleSavingStatus, setTitleSavingStatus] = useState<'saved' | 'saving'>('saved');
   
-  // Tools State
   const [drawMode, setDrawMode] = useState<'free' | 'straight'>('free');
   const [hasArrow, setHasArrow] = useState(true);
   const [isDashed, setIsDashed] = useState(false);
@@ -77,27 +72,21 @@ export default function PlaybookEditor() {
   const [players, setPlayers] = useState<Player[]>(defaultPlayers);
   const [routes, setRoutes] = useState<Route[]>([]);
 
-  // --- AUTH CHECK ---
+  // --- 1. AUTH CHECK ---
   useEffect(() => {
     let unsubscribeUserDoc: () => void;
-
     const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
       if (!currentUser) {
         router.push("/login");
       } else {
         setUser(currentUser);
-        
-        // Real-time listener for User Profile
         const userDocRef = doc(db, "users", currentUser.uid);
-        
         unsubscribeUserDoc = onSnapshot(userDocRef, (docSnap) => {
             if (docSnap.exists()) {
                 const data = docSnap.data();
                 setIsApproved(data.approved === true);
-
                 const dbSessionId = data.currentSessionId;
                 const localSessionId = localStorage.getItem("playmaker_session_id");
-
                 if (dbSessionId && localSessionId && dbSessionId !== localSessionId) {
                     alert("Security Alert: Your account was logged in on another device. You have been signed out.");
                     signOut(auth).then(() => router.push("/login"));
@@ -108,23 +97,20 @@ export default function PlaybookEditor() {
         });
       }
     });
-
     return () => {
         unsubscribeAuth();
         if (unsubscribeUserDoc) unsubscribeUserDoc();
     };
   }, [router]);
 
-  // --- FIREBASE SYNC ---
+  // --- 2. FETCH PLAYBOOKS ---
   useEffect(() => {
     if (!user || !isApproved) return;
-
     const q = query(
       collection(db, "playbooks"), 
       where("userId", "==", user.uid),
       orderBy("createdAt", "desc")
     );
-
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const books: Playbook[] = snapshot.docs.map(doc => ({
         id: doc.id,
@@ -134,20 +120,62 @@ export default function PlaybookEditor() {
       
       if (currentPlaybook) {
         const updated = books.find(b => b.id === currentPlaybook.id);
-        if (updated) setCurrentPlaybook(updated);
+        if (updated) {
+            setCurrentPlaybook(prev => prev ? ({ ...prev, title: updated.title }) : updated);
+        }
       }
     });
-
     return () => unsubscribe();
   }, [user, isApproved, currentPlaybook?.id]);
 
-  // --- ACTIONS ---
+  // --- 3. FETCH PLAYS (Secure Listener) ---
+  useEffect(() => {
+    // Only listen if we have a valid user AND a valid playbook open
+    if (!currentPlaybook || !user) return;
+
+    const playsRef = collection(db, "playbooks", currentPlaybook.id, "plays");
+    const q = query(playsRef, orderBy("createdAt", "asc"));
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+        const fetchedPlays: Play[] = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data()
+        } as Play));
+        setCurrentPlays(fetchedPlays);
+    }, (error) => {
+        console.error("Plays Listener Error:", error);
+        // If permission denied happens (e.g. parent deleted), force close editor
+        if (error.code === 'permission-denied') {
+            setView('library');
+            setCurrentPlaybook(null);
+        }
+    });
+
+    return () => unsubscribe();
+  }, [currentPlaybook?.id, user]); // Added user dependency
+
+  // --- 4. AUTO-SAVE TITLE ---
+  useEffect(() => {
+    if (!currentPlaybook || !playbookTitle) return;
+    if (playbookTitle === currentPlaybook.title) return;
+    setTitleSavingStatus('saving');
+    const handler = setTimeout(async () => {
+        try {
+            const bookRef = doc(db, "playbooks", currentPlaybook.id);
+            await updateDoc(bookRef, { title: playbookTitle });
+            setTitleSavingStatus('saved');
+        } catch (error) {
+            console.error("Auto-save title failed:", error);
+            setTitleSavingStatus('saved'); 
+        }
+    }, 1000); 
+    return () => clearTimeout(handler);
+  }, [playbookTitle, currentPlaybook]);
 
   const createNewPlaybook = async () => {
     if (!user) return;
     const newBook = { 
       title: "New Playbook", 
-      plays: [], 
       createdAt: serverTimestamp(),
       userId: user.uid
     };
@@ -164,26 +192,32 @@ export default function PlaybookEditor() {
     setCurrentPlaybook(book);
     setPlaybookTitle(book.title);
     setView('editor');
-    setRoutes([]);
-    setPlayers(defaultPlayers);
     setPlayName("Untitled Play");
+    setPlayers(defaultPlayers);
+    setRoutes([]);
+    setCurrentPlays([]); 
   };
 
   const deletePlaybook = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (confirm("Delete this playbook?")) {
-      await deleteDoc(doc(db, "playbooks", id));
-      if (currentPlaybook?.id === id) setView('library');
+      // 1. Unmount editor immediately to kill listener
+      if (currentPlaybook?.id === id) {
+          setView('library');
+          setCurrentPlaybook(null);
+      }
+      
+      // 2. Delete from DB
+      try {
+          await deleteDoc(doc(db, "playbooks", id));
+      } catch (err) {
+          console.error("Delete failed:", err);
+      }
     }
   };
 
-  const savePlaybookTitle = async (newTitle: string) => {
-    setPlaybookTitle(newTitle);
-    if (currentPlaybook) {
-      setCurrentPlaybook({ ...currentPlaybook, title: newTitle });
-      const bookRef = doc(db, "playbooks", currentPlaybook.id);
-      await updateDoc(bookRef, { title: newTitle });
-    }
+  const handleTitleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setPlaybookTitle(e.target.value);
   };
 
   const handleSignOut = async () => {
@@ -191,16 +225,11 @@ export default function PlaybookEditor() {
     router.push("/login");
   };
 
-  // --- FAST SAVE & FIX BLACK BG ---
   const savePlaySnapshot = async () => {
     if (!stageRef.current || !currentPlaybook) return;
-    
-    // Briefly block button to prevent double-click during capture
     setIsSaving(true); 
 
-    // 1. Capture Canvas (Auto-Crop)
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    
     players.forEach(p => {
         if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y;
         if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
@@ -218,54 +247,33 @@ export default function PlaybookEditor() {
     let w = (maxX - minX) + (PADDING * 2), h = (maxY - minY) + (PADDING * 2);
     if (x < 0) { w += x; x = 0; } if (y < 0) { h += y; y = 0; }
 
-    // FIXED: Use "image/png" to preserve transparency (no black background)
-    // Quality isn't used for PNG, but pixelRatio helps resolution
     const config = { x, y, width: w, height: h, pixelRatio: 1.5, mimeType: "image/png" };
     const dataUrl = stageRef.current.toDataURL(config);
 
-    // 2. OPTIMISTIC UPDATE (Instant Feedback)
-    const playId = uuidv4();
-    const tempPlay: Play = { id: playId, name: playName, image: dataUrl };
-    
-    const optimisticPlays = [...currentPlaybook.plays, tempPlay];
-    setCurrentPlaybook({ ...currentPlaybook, plays: optimisticPlays });
-    setPlayName(`Play ${optimisticPlays.length + 1}`);
-    
-    // Unlock UI immediately so it feels fast
-    setIsSaving(false); 
-
-    // 3. BACKGROUND UPLOAD
     try {
-        const storageRef = ref(storage, `plays/${currentPlaybook.id}/${playId}.png`);
-        await uploadString(storageRef, dataUrl, 'data_url');
-        const downloadURL = await getDownloadURL(storageRef);
-
-        // Update DB with Real URL silently
-        const finalPlay = { ...tempPlay, image: downloadURL };
-        const bookRef = doc(db, "playbooks", currentPlaybook.id);
-        
-        await updateDoc(bookRef, { 
-            plays: optimisticPlays.map(p => p.id === playId ? finalPlay : p) 
+        const playsCollectionRef = collection(db, "playbooks", currentPlaybook.id, "plays");
+        await addDoc(playsCollectionRef, {
+            name: playName,
+            image: dataUrl,
+            createdAt: serverTimestamp()
         });
-
+        setPlayName(`Play ${currentPlays.length + 2}`);
     } catch (e) {
-        console.error("Background save failed:", e);
-        // Silent fail or toast could go here
+        console.error("Save failed:", e);
+        alert("Failed to save play.");
+    } finally {
+        setIsSaving(false);
     }
   };
 
   const deletePlay = async (playId: string) => {
     if (!currentPlaybook) return;
     if (confirm("Delete this play?")) {
-      const playToDelete = currentPlaybook.plays.find(p => p.id === playId);
-      const updatedPlays = currentPlaybook.plays.filter(p => p.id !== playId);
-      
-      const bookRef = doc(db, "playbooks", currentPlaybook.id);
-      await updateDoc(bookRef, { plays: updatedPlays });
-
-      if (playToDelete) {
-          const imgRef = ref(storage, `plays/${currentPlaybook.id}/${playId}.png`);
-          deleteObject(imgRef).catch(() => {});
+      try {
+        const playDocRef = doc(db, "playbooks", currentPlaybook.id, "plays", playId);
+        await deleteDoc(playDocRef);
+      } catch (e) {
+        console.error("Error deleting play:", e);
       }
     }
   };
@@ -273,8 +281,6 @@ export default function PlaybookEditor() {
   const undoLastRoute = () => setRoutes(prev => prev.slice(0, -1));
   const deleteRoute = (id: string) => setRoutes(prev => prev.filter(r => r.id !== id));
   const clearRoutes = () => setRoutes([]);
-
-  // --- RENDER STATES ---
 
   if (!user || isApproved === null) {
     return (
@@ -291,14 +297,10 @@ export default function PlaybookEditor() {
           <div className="text-4xl mb-4">⏳</div>
           <h1 className="text-xl font-bold text-slate-800 mb-2">Access Pending</h1>
           <p className="text-gray-600 mb-6 text-sm leading-relaxed">
-            Thanks for signing up! Your account is currently under review.
+            Your account is waiting for approval.
           </p>
-          <div className="bg-gray-50 p-3 rounded-lg mb-6 border border-gray-100">
-            <p className="text-xs text-gray-400 uppercase font-bold tracking-wide">Registered Email</p>
-            <p className="text-slate-700 font-mono text-sm mt-1">{user.email}</p>
-          </div>
           <button onClick={handleSignOut} className="text-red-500 font-bold text-sm hover:underline">
-            Sign Out & Check Later
+            Sign Out
           </button>
         </div>
       </div>
@@ -315,10 +317,6 @@ export default function PlaybookEditor() {
               <p className="text-slate-500 mt-2">Manage your team's strategies.</p>
             </div>
             <div className="flex items-center gap-4">
-               <div className="text-right hidden sm:block">
-                 <p className="text-xs text-gray-400 font-bold uppercase">Logged in as</p>
-                 <p className="text-sm text-gray-700 font-medium">{user.email}</p>
-               </div>
                <button onClick={handleSignOut} className="text-gray-400 hover:text-red-500 font-bold text-sm px-3 py-2">
                  Sign Out
                </button>
@@ -335,9 +333,9 @@ export default function PlaybookEditor() {
                   <button onClick={(e) => deletePlaybook(book.id, e)} className="text-slate-400 hover:text-red-500 p-2 opacity-0 group-hover:opacity-100 transition">🗑</button>
                 </div>
                 <h3 className="text-xl font-bold text-slate-800 mb-1">{book.title}</h3>
-                <p className="text-sm text-slate-500">{book.plays.length} plays</p>
-                <div className="flex gap-1 mt-4 h-12 overflow-hidden opacity-50">
-                   {book.plays.slice(0, 3).map(p => <img key={p.id} src={p.image} className="h-full w-auto border rounded" />)}
+                <p className="text-sm text-slate-500">Open to view plays</p>
+                <div className="flex gap-1 mt-4 h-12 overflow-hidden opacity-50 bg-gray-50 rounded border border-gray-100">
+                   <div className="w-full h-full flex items-center justify-center text-gray-300 text-xs">Preview</div>
                 </div>
               </div>
             ))}
@@ -354,13 +352,16 @@ export default function PlaybookEditor() {
           <button onClick={() => setView('library')} className="text-gray-500 hover:text-blue-600 font-bold text-sm flex items-center gap-1">← Library</button>
           <div className="h-8 w-[1px] bg-gray-300 mx-2"></div>
           <div>
-            <input value={playbookTitle} onChange={(e) => savePlaybookTitle(e.target.value)} className="text-2xl font-bold text-gray-900 bg-transparent hover:bg-white border border-transparent hover:border-gray-200 rounded px-1 -ml-1 focus:ring-2 focus:ring-blue-500 outline-none" />
-            <p className="text-xs text-gray-500 mt-0.5">{currentPlaybook?.plays.length || 0} Plays Saved</p>
+            <div className="flex items-center gap-2">
+              <input value={playbookTitle} onChange={handleTitleChange} className="text-2xl font-bold text-gray-900 bg-transparent hover:bg-white border border-transparent hover:border-gray-200 rounded px-1 -ml-1 focus:ring-2 focus:ring-blue-500 outline-none" />
+              {titleSavingStatus === 'saving' && <span className="text-xs text-gray-400 animate-pulse">Saving...</span>}
+            </div>
+            <p className="text-xs text-gray-500 mt-0.5">{currentPlays.length} Plays Saved</p>
           </div>
         </div>
         <div className="flex gap-3">
-          <button onClick={() => generatePDF(currentPlaybook?.plays || [], 'sheet')} className="bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 px-4 py-2 rounded-lg shadow-sm font-medium transition flex items-center gap-2"><span>📄</span> A4 Sheet</button>
-          <button onClick={() => generatePDF(currentPlaybook?.plays || [], 'wristband')} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-lg shadow-sm font-medium transition flex items-center gap-2"><span>⌚</span> Wristband</button>
+          <button onClick={() => generatePDF(currentPlays, 'sheet')} className="bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 px-4 py-2 rounded-lg shadow-sm font-medium transition flex items-center gap-2"><span>📄</span> A4 Sheet</button>
+          <button onClick={() => generatePDF(currentPlays, 'wristband')} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-lg shadow-sm font-medium transition flex items-center gap-2"><span>⌚</span> Wristband</button>
         </div>
       </header>
 
@@ -392,7 +393,7 @@ export default function PlaybookEditor() {
           <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 h-[380px] flex flex-col">
             <h3 className="font-semibold text-gray-700 mb-2">Plays in Book</h3>
             <div className="flex-1 overflow-y-auto space-y-2 pr-1 custom-scrollbar">
-              {currentPlaybook?.plays.map((p, idx) => (
+              {currentPlays.map((p, idx) => (
                 <div key={p.id} className="flex justify-between items-center p-2 border rounded hover:bg-gray-50 group">
                   <div className="flex items-center gap-3 overflow-hidden">
                     <span className="text-gray-400 font-mono text-xs">{idx + 1}</span>
@@ -404,7 +405,7 @@ export default function PlaybookEditor() {
                   </div>
                 </div>
               ))}
-              {currentPlaybook?.plays.length === 0 && <p className="text-center text-gray-400 text-xs mt-10">Empty Playbook</p>}
+              {currentPlays.length === 0 && <p className="text-center text-gray-400 text-xs mt-10">Empty Playbook</p>}
             </div>
           </div>
         </div>
