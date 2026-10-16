@@ -1,10 +1,15 @@
 "use client";
 import React, { useState } from "react";
+import dynamic from "next/dynamic";
 import { auth, db } from "@/utils/firebase"; 
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword } from "firebase/auth";
-import { doc, setDoc, updateDoc } from "firebase/firestore"; // Added updateDoc
+import { doc, setDoc } from "firebase/firestore";
 import { useRouter } from "next/navigation";
 import { v4 as uuidv4 } from "uuid"; // Added uuid import
+
+const DarkModeToggle = dynamic(() => import("@/components/DarkModeToggle"), {
+  ssr: false,
+});
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
@@ -52,9 +57,11 @@ export default function LoginPage() {
 
         // Update the existing user doc with the NEW Session ID
         // This effectively "invalidates" any other device logged in with the old ID
-        await updateDoc(doc(db, "users", uid), {
-            currentSessionId: newSessionId
-        });
+        // Use setDoc with merge so login works even if the users doc was never created
+        await setDoc(doc(db, "users", uid), {
+            currentSessionId: newSessionId,
+            email: userCredential.user.email ?? email,
+        }, { merge: true });
       }
 
       // 2. Save Session ID to Local Device
@@ -68,42 +75,45 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-100">
-      <div className="bg-white p-8 rounded-xl shadow-md w-96">
-        <h1 className="text-2xl font-bold text-center mb-6 text-slate-800">
+    <div className="min-h-screen flex items-center justify-center bg-gray-100 dark:bg-gray-950 relative">
+      <div className="absolute top-4 right-4">
+        <DarkModeToggle />
+      </div>
+      <div className="bg-white dark:bg-gray-800 p-8 rounded-xl shadow-md w-96">
+        <h1 className="text-2xl font-bold text-center mb-6 text-slate-800 dark:text-slate-100">
           {isSignUp ? "Request Access" : "Welcome Back"}
         </h1>
-        
-        {error && <p className="text-red-500 text-sm mb-4 text-center bg-red-50 p-2 rounded">{error}</p>}
+
+        {error && <p className="text-red-500 text-sm mb-4 text-center bg-red-50 dark:bg-red-900/30 p-2 rounded">{error}</p>}
 
         <form onSubmit={handleAuth} className="space-y-4">
           <div>
-            <label className="text-xs font-bold text-gray-500 uppercase">Email</label>
-            <input 
-              type="email" 
+            <label className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase">Email</label>
+            <input
+              type="email"
               required
-              className="w-full p-3 border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 outline-none text-slate-900"
+              className="w-full p-3 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 rounded focus:ring-2 focus:ring-blue-500 outline-none text-slate-900 dark:text-white"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
             />
           </div>
           <div>
-            <label className="text-xs font-bold text-gray-500 uppercase">Password</label>
-            <input 
-              type="password" 
+            <label className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase">Password</label>
+            <input
+              type="password"
               required
-              className="w-full p-3 border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 outline-none text-slate-900"
+              className="w-full p-3 border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 rounded focus:ring-2 focus:ring-blue-500 outline-none text-slate-900 dark:text-white"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
             />
           </div>
-          
+
           <button type="submit" className="w-full bg-blue-600 text-white py-3 rounded-lg font-bold hover:bg-blue-700 transition">
             {isSignUp ? "Submit Request" : "Log In"}
           </button>
         </form>
 
-        <p className="text-center mt-4 text-sm text-gray-600">
+        <p className="text-center mt-4 text-sm text-gray-600 dark:text-gray-400">
           {isSignUp ? "Already have an account?" : "Need an account?"}{" "}
           <button 
             onClick={() => setIsSignUp(!isSignUp)} 
