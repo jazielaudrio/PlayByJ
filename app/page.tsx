@@ -17,7 +17,8 @@ import {
   orderBy,
   serverTimestamp,
   where,
-  getDoc
+  getDoc,
+  writeBatch
 } from "firebase/firestore";
 import { onAuthStateChanged, signOut } from "firebase/auth";
 import { useRouter } from "next/navigation";
@@ -48,7 +49,7 @@ const PlayDiagram = dynamic(() => import("@/components/PlayDiagram"), {
 // Types
 type Player = { id: string; x: number; y: number; color: string; label: string };
 type Route = { id: string; points: number[]; color: string; hasArrow: boolean; isDashed: boolean; tension?: number; open?: boolean };
-type Play = { id: string; name: string; image?: string; status?: 'syncing' | 'saved' | 'error'; players?: Player[]; routes?: Route[]; category?: PlayCategory };
+type Play = { id: string; name: string; image?: string; status?: 'syncing' | 'saved' | 'error'; players?: Player[]; routes?: Route[]; category?: PlayCategory; order?: number };
 
 type Playbook = {
   id: string;
@@ -81,6 +82,9 @@ export default function PlaybookEditor() {
   const [view, setView] = useState<'editor' | 'library' | 'playcall'>('library');
   const [isSaving, setIsSaving] = useState(false);
   const [editingPlayId, setEditingPlayId] = useState<string | null>(null);
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const [dropIndex, setDropIndex] = useState<number | null>(null);
+  const [isReordering, setIsReordering] = useState(false);
   const router = useRouter();
 
   // Editor State
@@ -187,8 +191,15 @@ export default function PlaybookEditor() {
                 players: data.players,
                 routes: data.routes,
                 category: data.category,
+                order: typeof data.order === 'number' ? data.order : undefined,
                 status: 'saved'
             };
+        });
+        // Order by explicit `order` field; legacy plays without it keep createdAt (fetch) order
+        fetchedPlays.sort((a, b) => {
+          const ao = a.order ?? Number.MAX_SAFE_INTEGER;
+          const bo = b.order ?? Number.MAX_SAFE_INTEGER;
+          return ao - bo;
         });
         setCurrentPlays(fetchedPlays);
     });
@@ -325,6 +336,7 @@ export default function PlaybookEditor() {
       const { open: _open, ...rest } = r;
       return { ...rest, points: [...rest.points] };
     });
+    const nextOrder = currentPlays.reduce((m, p) => Math.max(m, p.order ?? -1), -1) + 1;
     const tempPlay: Play = {
         id: playId,
         name: playName,
@@ -332,6 +344,7 @@ export default function PlaybookEditor() {
         players: playersSnapshot,
         routes: routesSnapshot,
         category: playCategory,
+        order: editingPlayId ? currentPlays.find(p => p.id === editingPlayId)?.order : nextOrder,
         status: 'syncing'
     };
 
@@ -352,6 +365,7 @@ export default function PlaybookEditor() {
             players: playersSnapshot,
             routes: routesSnapshot,
             category: playCategory,
+            order: editingPlayId ? currentPlays.find(p => p.id === editingPlayId)?.order ?? 0 : nextOrder,
             createdAt: serverTimestamp()
         };
         if (editingPlayId) {
@@ -439,6 +453,36 @@ export default function PlaybookEditor() {
       console.error("Failed to update category:", e);
       alert("Failed to save category.");
     }
+  };
+
+  const persistPlayOrder = async (ordered: Play[]) => {
+    if (!currentPlaybook || currentPlaybook.id === SAMPLE_BOOK_ID) return;
+    setIsReordering(true);
+    try {
+      const batch = writeBatch(db);
+      ordered.forEach((p, i) => {
+        if (p.status && p.status !== 'saved') return; // don't persist temp/error rows
+        batch.update(doc(db, "playbooks", currentPlaybook.id, "plays", p.id), { order: i });
+      });
+      await batch.commit();
+    } catch (e) {
+      console.error("Failed to save play order:", e);
+      alert("Failed to save new play order.");
+    } finally {
+      setIsReordering(false);
+    }
+  };
+
+  const movePlay = async (from: number, to: number) => {
+    if (from === to || from < 0 || to < 0 || to >= currentPlays.length) return;
+    const reordered = [...currentPlays];
+    const [moved] = reordered.splice(from, 1);
+    reordered.splice(to, 0, moved);
+    const withOrder = reordered.map((p, i) => ({ ...p, order: i }));
+    setCurrentPlays(withOrder);
+    setDragIndex(null);
+    setDropIndex(null);
+    await persistPlayOrder(withOrder);
   };
 
   // --- RENDER ---
@@ -592,20 +636,57 @@ export default function PlaybookEditor() {
           </div>
 
           <div className="bg-white dark:bg-gray-800 p-4 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700 h-[380px] flex flex-col">
-            <h3 className="font-semibold text-gray-700 dark:text-gray-200 mb-2">Plays in Book</h3>
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="font-semibold text-gray-700 dark:text-gray-200">Plays in Book</h3>
+              {isReordering && <span className="text-[10px] text-blue-500 animate-pulse font-bold">Saving order…</span>}
+            </div>
+            <p className="text-[10px] text-gray-400 dark:text-gray-500 mb-2">Drag ⋮⋮ or use ↑↓ to rearrange — order carries to PDFs & wristbands.</p>
             <div className="flex-1 overflow-y-auto space-y-2 pr-1 custom-scrollbar">
               {currentPlays.map((p, idx) => {
                 const isEditing = editingPlayId === p.id;
                 const isReEditable = !!(p.players && p.routes);
+                const isDragging = dragIndex === idx;
+                const isDropTarget = dropIndex === idx && dragIndex !== null && dragIndex !== idx;
                 return (
                 <div
                   key={p.id}
                   onClick={() => loadPlayForEdit(p)}
+                  onDragOver={(e) => { e.preventDefault(); if (dragIndex !== null && dragIndex !== idx) setDropIndex(idx); }}
+                  onDrop={(e) => { e.preventDefault(); if (dragIndex !== null) movePlay(dragIndex, idx); }}
+                  onDragLeave={() => { if (dropIndex === idx) setDropIndex(null); }}
                   title={isReEditable ? "Click to re-edit this play" : "Old image-only format — can't re-edit"}
-                  className={`flex justify-between items-center p-2 border border-gray-200 dark:border-gray-700 rounded hover:bg-gray-50 dark:hover:bg-gray-700 group cursor-pointer transition ${isEditing ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/30 dark:border-blue-500 ring-1 ring-blue-500' : ''}`}
+                  className={`flex justify-between items-center p-2 border rounded hover:bg-gray-50 dark:hover:bg-gray-700 group cursor-pointer transition ${isEditing ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/30 dark:border-blue-500 ring-1 ring-blue-500' : 'border-gray-200 dark:border-gray-700'} ${isDragging ? 'opacity-40' : ''} ${isDropTarget ? 'border-t-2 border-t-blue-500' : ''}`}
                 >
-                  <div className="flex items-center gap-2 overflow-hidden">
-                    <span className="text-gray-400 font-mono text-xs">{idx + 1}</span>
+                  <div className="flex items-center gap-1.5 overflow-hidden">
+                    <span
+                      draggable
+                      onDragStart={(e) => { e.stopPropagation(); setDragIndex(idx); e.dataTransfer.effectAllowed = 'move'; }}
+                      onDragEnd={() => { setDragIndex(null); setDropIndex(null); }}
+                      onClick={(e) => e.stopPropagation()}
+                      title="Drag to reorder"
+                      className="cursor-grab active:cursor-grabbing text-gray-300 hover:text-gray-500 dark:hover:text-gray-300 px-0.5 select-none touch-none font-bold tracking-tighter"
+                    >
+                      ⋮⋮
+                    </span>
+                    <span className="text-gray-400 font-mono text-xs w-4 text-right">{idx + 1}</span>
+                    <span className="flex flex-col leading-none opacity-0 group-hover:opacity-100 transition">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); movePlay(idx, idx - 1); }}
+                        disabled={idx === 0 || isReordering}
+                        title="Move up"
+                        className="text-[10px] text-gray-400 hover:text-blue-600 disabled:opacity-30 disabled:hover:text-gray-400 px-0.5"
+                      >
+                        ▲
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); movePlay(idx, idx + 1); }}
+                        disabled={idx === currentPlays.length - 1 || isReordering}
+                        title="Move down"
+                        className="text-[10px] text-gray-400 hover:text-blue-600 disabled:opacity-30 disabled:hover:text-gray-400 px-0.5"
+                      >
+                        ▼
+                      </button>
+                    </span>
                     <span className={`w-2 h-2 rounded-full shrink-0 ${p.category ? CATEGORY_META[p.category].dot : 'bg-gray-300 dark:bg-gray-600'}`} title={p.category ? CATEGORY_META[p.category].label : 'Uncategorized'} />
                     <span className="text-sm font-medium truncate w-20">{p.name}</span>
                     {p.status === 'syncing' && <span className="text-[10px] text-blue-500 animate-pulse">Sync...</span>}
