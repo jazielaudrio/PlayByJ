@@ -1,9 +1,11 @@
 "use client";
 import React from "react";
+import { FIELD_W, FIELD_H, LOS_Y } from "@/utils/field";
+import { FOOTBALL_STICKER, type Sticker } from "@/utils/stickers";
 
 // Lightweight SVG diagram renderer for plays that have vectors but no
 // snapshot image (e.g. the built-in sample playbook). Same 800x500
-// coordinate system and yard lines as the Konva field.
+// coordinate system and line of scrimmage as the Konva field.
 
 export interface DiagramPlayer {
   x: number;
@@ -22,10 +24,9 @@ export interface DiagramRoute {
 interface PlayDiagramProps {
   players: DiagramPlayer[];
   routes: DiagramRoute[];
+  stickers?: Sticker[];
   className?: string;
 }
-
-const YARD_LINES = [50, 150, 250, 350, 450];
 
 function toPairs(points: number[]): string {
   const pairs: string[] = [];
@@ -35,9 +36,9 @@ function toPairs(points: number[]): string {
   return pairs.join(" ");
 }
 
-export default function PlayDiagram({ players, routes, className }: PlayDiagramProps) {
+export default function PlayDiagram({ players, routes, stickers, className }: PlayDiagramProps) {
   return (
-    <svg viewBox="0 0 800 500" className={className} role="img">
+    <svg viewBox={`0 0 ${FIELD_W} ${FIELD_H}`} className={className} role="img">
       <defs>
         <marker
           id="pd-arrow"
@@ -52,10 +53,9 @@ export default function PlayDiagram({ players, routes, className }: PlayDiagramP
           <path d="M2,3 L17,10 L2,17 z" fill="#111" />
         </marker>
       </defs>
-      <rect x="0" y="0" width="800" height="500" fill="#f0fdf4" />
-      {YARD_LINES.map((y) => (
-        <line key={y} x1="0" y1={y} x2="800" y2={y} stroke="#94a3b8" strokeWidth="2" opacity="0.7" />
-      ))}
+      <rect x="0" y="0" width={FIELD_W} height={FIELD_H} fill="#f0fdf4" />
+      {/* Line of scrimmage — the single reference line */}
+      <line x1="0" y1={LOS_Y} x2={FIELD_W} y2={LOS_Y} stroke="#64748b" strokeWidth="2.5" />
       {routes.map((r, i) => (
         <polyline
           key={i}
@@ -85,6 +85,35 @@ export default function PlayDiagram({ players, routes, className }: PlayDiagramP
           </text>
         </React.Fragment>
       ))}
+      {stickers?.map((s) => {
+        const f = FOOTBALL_STICKER;
+        return (
+          <g key={s.id} transform={`translate(${s.x} ${s.y}) rotate(${s.rotation ?? f.rotation})`}>
+            <ellipse rx={f.rx} ry={f.ry} fill={f.body} stroke={f.outline} strokeWidth={f.strokeWidth} />
+            <line
+              x1={-f.seamHalfLength}
+              y1={0}
+              x2={f.seamHalfLength}
+              y2={0}
+              stroke={f.seam}
+              strokeWidth="2.5"
+              strokeLinecap="round"
+            />
+            {f.laceXs.map((x) => (
+              <line
+                key={x}
+                x1={x}
+                y1={-f.laceY}
+                x2={x}
+                y2={f.laceY}
+                stroke={f.seam}
+                strokeWidth="2"
+                strokeLinecap="round"
+              />
+            ))}
+          </g>
+        );
+      })}
     </svg>
   );
 }

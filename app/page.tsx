@@ -4,6 +4,7 @@ import dynamic from "next/dynamic";
 import { generatePDF } from "@/utils/pdfGenerator";
 import { type PlayCategory, CATEGORY_META } from "@/utils/playcall";
 import { SAMPLE_BOOK_ID, SAMPLE_BOOK_TITLE, SAMPLE_PLAYS } from "@/utils/samplePlaybook";
+import { createFootballSticker, STICKER_EXTENT, type Sticker } from "@/utils/stickers";
 import { v4 as uuidv4 } from "uuid";
 import { db, auth } from "@/utils/firebase"; 
 import { 
@@ -49,7 +50,7 @@ const PlayDiagram = dynamic(() => import("@/components/PlayDiagram"), {
 // Types
 type Player = { id: string; x: number; y: number; color: string; label: string };
 type Route = { id: string; points: number[]; color: string; hasArrow: boolean; isDashed: boolean; tension?: number; open?: boolean };
-type Play = { id: string; name: string; image?: string; status?: 'syncing' | 'saved' | 'error'; players?: Player[]; routes?: Route[]; category?: PlayCategory; order?: number };
+type Play = { id: string; name: string; image?: string; status?: 'syncing' | 'saved' | 'error'; players?: Player[]; routes?: Route[]; stickers?: Sticker[]; category?: PlayCategory; order?: number };
 
 type Playbook = {
   id: string;
@@ -98,16 +99,19 @@ export default function PlaybookEditor() {
   const [hasArrow, setHasArrow] = useState(true);
   const [isDashed, setIsDashed] = useState(false);
   
+  // New plays start in the stock formation, lined up exactly on the LOS
+  // (y=372, backfield ~2.5 yds behind) so every play begins consistently.
   const defaultPlayers: Player[] = [
-    { id: 'qb', x: 400, y: 400, color: 'red', label: 'QB' },
-    { id: 'c', x: 400, y: 350, color: 'blue', label: 'C' },
-    { id: 'wr1', x: 200, y: 350, color: 'orange', label: 'X' },
-    { id: 'wr2', x: 600, y: 350, color: 'green', label: 'Y' },
-    { id: 'rb', x: 450, y: 400, color: 'pink', label: 'Z' },
+    { id: 'qb', x: 400, y: 425, color: 'red', label: 'QB' },
+    { id: 'c', x: 400, y: 372, color: 'blue', label: 'C' },
+    { id: 'wr1', x: 200, y: 372, color: 'orange', label: 'X' },
+    { id: 'wr2', x: 600, y: 372, color: 'green', label: 'Y' },
+    { id: 'rb', x: 450, y: 425, color: 'pink', label: 'Z' },
   ];
   
   const [players, setPlayers] = useState<Player[]>(defaultPlayers);
   const [routes, setRoutes] = useState<Route[]>([]);
+  const [stickers, setStickers] = useState<Sticker[]>([]);
 
   // --- 1. AUTH CHECK ---
   useEffect(() => {
@@ -190,6 +194,7 @@ export default function PlaybookEditor() {
                 image: data.image,
                 players: data.players,
                 routes: data.routes,
+                stickers: data.stickers,
                 category: data.category,
                 order: typeof data.order === 'number' ? data.order : undefined,
                 status: 'saved'
@@ -255,6 +260,7 @@ export default function PlaybookEditor() {
     setPlayCategory('medium');
     setPlayers(defaultPlayers);
     setRoutes([]);
+    setStickers([]);
     setCurrentPlays([]);
     setEditingPlayId(null);
   };
@@ -271,6 +277,7 @@ export default function PlaybookEditor() {
     setPlayCategory('medium');
     setPlayers(defaultPlayers);
     setRoutes([]);
+    setStickers([]);
     setCurrentPlays(samplePlays);
     setEditingPlayId(null);
     setView('playcall');
@@ -321,6 +328,12 @@ export default function PlaybookEditor() {
             if (x > maxX) maxX = x; if (y > maxY) maxY = y;
         }
     });
+    stickers.forEach(s => {
+        if (s.x - STICKER_EXTENT < minX) minX = s.x - STICKER_EXTENT;
+        if (s.y - STICKER_EXTENT < minY) minY = s.y - STICKER_EXTENT;
+        if (s.x + STICKER_EXTENT > maxX) maxX = s.x + STICKER_EXTENT;
+        if (s.y + STICKER_EXTENT > maxY) maxY = s.y + STICKER_EXTENT;
+    });
     if (minX === Infinity) { minX = 0; minY = 0; maxX = 800; maxY = 500; }
     const PADDING = 30;
     let x = minX - PADDING, y = minY - PADDING;
@@ -336,6 +349,7 @@ export default function PlaybookEditor() {
       const { open: _open, ...rest } = r;
       return { ...rest, points: [...rest.points] };
     });
+    const stickersSnapshot = stickers.map(s => ({ ...s }));
     const nextOrder = currentPlays.reduce((m, p) => Math.max(m, p.order ?? -1), -1) + 1;
     const tempPlay: Play = {
         id: playId,
@@ -343,6 +357,7 @@ export default function PlaybookEditor() {
         image: dataUrl,
         players: playersSnapshot,
         routes: routesSnapshot,
+        stickers: stickersSnapshot,
         category: playCategory,
         order: editingPlayId ? currentPlays.find(p => p.id === editingPlayId)?.order : nextOrder,
         status: 'syncing'
@@ -350,7 +365,7 @@ export default function PlaybookEditor() {
 
     // Editing mode: update canvas optimistically, persist below
     if (editingPlayId) {
-      setCurrentPlays(prev => prev.map(p => p.id === editingPlayId ? { ...p, name: playName, image: dataUrl, players: playersSnapshot, routes: routesSnapshot, category: playCategory } : p));
+      setCurrentPlays(prev => prev.map(p => p.id === editingPlayId ? { ...p, name: playName, image: dataUrl, players: playersSnapshot, routes: routesSnapshot, stickers: stickersSnapshot, category: playCategory } : p));
     } else {
       setCurrentPlays(prev => [...prev, tempPlay]);
       setPlayName(`Play ${currentPlays.length + 2}`);
@@ -364,6 +379,7 @@ export default function PlaybookEditor() {
             image: dataUrl,
             players: playersSnapshot,
             routes: routesSnapshot,
+            stickers: stickersSnapshot,
             category: playCategory,
             order: editingPlayId ? currentPlays.find(p => p.id === editingPlayId)?.order ?? 0 : nextOrder,
             createdAt: serverTimestamp()
@@ -399,6 +415,7 @@ export default function PlaybookEditor() {
         setEditingPlayId(null);
         setPlayers(defaultPlayers);
         setRoutes([]);
+        setStickers([]);
       }
 
       try {
@@ -415,6 +432,19 @@ export default function PlaybookEditor() {
   const deleteRoute = (id: string) => setRoutes(prev => prev.filter(r => r.id !== id));
   const clearRoutes = () => setRoutes([]);
 
+  // Stickers are free-floating decorations saved with the play. New ones fan
+  // out from the middle of the field so repeated clicks never stack exactly.
+  const addFootballSticker = () => {
+    const n = stickers.length;
+    const col = n % 3;
+    const row = Math.floor(n / 3) % 4;
+    const x = 400 + (col - 1) * 56;
+    const y = 300 - row * 38;
+    setStickers(prev => [...prev, createFootballSticker(uuidv4(), x, y)]);
+  };
+  const deleteSticker = (id: string) => setStickers(prev => prev.filter(s => s.id !== id));
+  const clearStickers = () => setStickers([]);
+
   // Shared styling for the drawing-tool toggle buttons (light + dark)
   const toolBtn = (active: boolean) =>
     `p-2 text-xs font-bold rounded border transition ${active
@@ -430,6 +460,7 @@ export default function PlaybookEditor() {
     }
     setPlayers(play.players.map(p => ({ ...p })));
     setRoutes(play.routes.map(r => ({ ...r, points: [...r.points] })));
+    setStickers((play.stickers ?? []).map(s => ({ ...s })));
     setPlayName(play.name);
     setPlayCategory(play.category ?? 'medium');
     setEditingPlayId(play.id);
@@ -441,6 +472,7 @@ export default function PlaybookEditor() {
     setPlayCategory('medium');
     setPlayers(defaultPlayers);
     setRoutes([]);
+    setStickers([]);
   };
 
   const recategorizePlay = async (playId: string, category: PlayCategory) => {
@@ -593,8 +625,8 @@ export default function PlaybookEditor() {
         <div className="flex gap-3 items-center">
           <DarkModeToggle />
           <button onClick={() => setView('playcall')} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700 px-4 py-2 rounded-lg shadow-sm font-medium transition flex items-center gap-2"><span>📢</span> Playcall</button>
-          <button onClick={() => generatePDF(currentPlays, 'sheet')} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700 px-4 py-2 rounded-lg shadow-sm font-medium transition flex items-center gap-2"><span>📄</span> A4 Sheet</button>
-          <button onClick={() => generatePDF(currentPlays, 'wristband')} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-lg shadow-sm font-medium transition flex items-center gap-2"><span>⌚</span> Wristband</button>
+          <button onClick={() => generatePDF(currentPlays, 'sheet', playbookTitle)} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700 px-4 py-2 rounded-lg shadow-sm font-medium transition flex items-center gap-2"><span>📄</span> A4 Sheet</button>
+          <button onClick={() => generatePDF(currentPlays, 'wristband', playbookTitle)} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-lg shadow-sm font-medium transition flex items-center gap-2"><span>⌚</span> Wristband</button>
         </div>
       </header>
 
@@ -612,6 +644,28 @@ export default function PlaybookEditor() {
                <button onClick={() => setHasArrow(false)} className={toolBtn(!hasArrow)}>— Line</button>
             </div>
             <p className="text-[11px] text-gray-400 dark:text-gray-500 leading-snug">Arrow mode: every stroke ends with an arrow. Line mode: left-drag draws & continues (press the blue dot to extend smoothly), right-drag ends with an arrow. Esc / Finish line ends without arrow. Curved auto-smooths your stroke (works with Solid/Dashed).</p>
+            <div className="pt-2 border-t border-gray-100 dark:border-gray-700">
+               <label className="text-xs font-bold text-gray-500 dark:text-gray-400">Stickers</label>
+               <div className="grid grid-cols-2 gap-2 mt-1">
+                 <button
+                   onClick={addFootballSticker}
+                   title="Place a football sticker on the field"
+                   className={`${toolBtn(false)} flex items-center justify-center gap-1 ${stickers.length === 0 ? 'col-span-2' : ''}`}
+                 >
+                   🏈 Add Football
+                 </button>
+                 {stickers.length > 0 && (
+                   <button
+                     onClick={clearStickers}
+                     title="Remove every sticker from this play"
+                     className="p-2 text-xs font-bold rounded border border-red-100 dark:border-red-900/60 text-red-600 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-900/30 transition"
+                   >
+                     Clear ({stickers.length})
+                   </button>
+                 )}
+               </div>
+               <p className="text-[11px] text-gray-400 dark:text-gray-500 leading-snug mt-1">Drag a sticker to move it. Double-click (or double-tap) it to remove.</p>
+            </div>
             <div className="pt-2 border-t border-gray-100 dark:border-gray-700">
                <label className="text-xs font-bold text-gray-500 dark:text-gray-400">Play Category</label>
                <div className="grid grid-cols-4 gap-1 mt-1">
@@ -710,7 +764,7 @@ export default function PlaybookEditor() {
                     {p.image ? (
                       <img src={p.image} className="w-8 h-5 object-cover border rounded bg-white" />
                     ) : p.players && p.routes ? (
-                      <PlayDiagram players={p.players} routes={p.routes} className="w-12 h-8 object-cover border rounded bg-white" />
+                      <PlayDiagram players={p.players} routes={p.routes} stickers={p.stickers} className="w-12 h-8 object-cover border rounded bg-white" />
                     ) : null}
                     <button onClick={(e) => { e.stopPropagation(); deletePlay(p.id); }} className="text-gray-300 hover:text-red-500 transition">×</button>
                   </div>
@@ -733,7 +787,7 @@ export default function PlaybookEditor() {
               );
             })()}
             <div className="flex justify-center items-center w-full">
-              <PlayCanvas players={players} routes={routes} setPlayers={setPlayers} setRoutes={setRoutes} stageRef={stageRef} onDeleteRoute={deleteRoute} drawMode={drawMode} hasArrow={hasArrow} isDashed={isDashed} />
+              <PlayCanvas players={players} routes={routes} stickers={stickers} setPlayers={setPlayers} setRoutes={setRoutes} setStickers={setStickers} stageRef={stageRef} onDeleteRoute={deleteRoute} onDeleteSticker={deleteSticker} drawMode={drawMode} hasArrow={hasArrow} isDashed={isDashed} />
             </div>
             <p className="text-[11px] text-gray-400 mt-2 mb-1">{editingPlayId ? "Saving updates this play." : "Click a play in the list to load it for re-editing."}</p>
         </div>

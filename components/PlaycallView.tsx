@@ -24,6 +24,7 @@ import {
   type CallRecord,
 } from "@/utils/playcall";
 import type { DiagramPlayer, DiagramRoute } from "./PlayDiagram";
+import type { Sticker } from "@/utils/stickers";
 
 const DarkModeToggle = dynamic(() => import("@/components/DarkModeToggle"), {
   ssr: false,
@@ -39,6 +40,7 @@ export interface CallablePlay {
   category?: PlayCategory;
   players?: DiagramPlayer[];
   routes?: DiagramRoute[];
+  stickers?: Sticker[];
   [key: string]: unknown;
 }
 
@@ -348,6 +350,7 @@ export default function PlaycallView({ playbookId, playbookTitle, plays, onBack,
                     <PlayDiagram
                       players={displayed.play.players}
                       routes={displayed.play.routes}
+                      stickers={displayed.play.stickers}
                       className="w-full max-w-[800px] rounded-lg border-2 border-slate-200 dark:border-slate-700 shadow-inner"
                     />
                   ) : (

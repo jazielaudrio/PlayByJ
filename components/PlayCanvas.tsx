@@ -1,7 +1,9 @@
 "use client";
 import React, { useEffect, useRef, useState } from "react";
-import { Stage, Layer, Circle, Arrow, Text, Line } from "react-konva";
+import { Stage, Layer, Circle, Arrow, Text, Line, Group, Rect, Ellipse } from "react-konva";
 import { KonvaEventObject } from "konva/lib/Node";
+import { FIELD_W, FIELD_H, LOS_Y, PX_PER_YARD } from "@/utils/field";
+import { FOOTBALL_STICKER, type Sticker } from "@/utils/stickers";
 
 // --- TYPES ---
 export type Player = { id: string; x: number; y: number; color: string; label: string };
@@ -20,10 +22,13 @@ export type DrawMode = 'free' | 'straight' | 'curve';
 interface PlayCanvasProps {
   players: Player[];
   routes: Route[];
+  stickers: Sticker[];
   setRoutes: (r: Route[]) => void;
   setPlayers: (p: Player[]) => void;
+  setStickers: (s: Sticker[]) => void;
   stageRef: any;
   onDeleteRoute: (id: string) => void;
+  onDeleteSticker: (id: string) => void;
   drawMode: DrawMode;
   hasArrow: boolean;
   isDashed: boolean;
@@ -35,6 +40,7 @@ const RDP_EPSILON = 3; // simplification tolerance (px)
 const ARROW_ANCHOR_LEN = 20; // arrow direction measured over at least this length
 const CHAIN_JOIN_RADIUS = 30; // new plain stroke within this of chain end continues it
 const CHAIN_TAIL_POINTS = 3; // seed smoothing with this many tail points for kink-free joints
+const SNAP_RADIUS = 10; // px tolerance for player snap-to guides (half a yard)
 
 function simplifyRDP(points: number[], epsilon: number): number[] {
   if (points.length <= 6) return points;
@@ -159,25 +165,88 @@ function fitQuadraticCurve(raw: number[]): number[] {
   return out;
 }
 
+// A draggable football sticker. Drawn as vector shapes (not an emoji) so it
+// renders identically on the canvas, in SVG thumbnails, and in PDF exports.
+function FootballStickerNode({
+  sticker,
+  onMove,
+  onDelete,
+  drawMode,
+}: {
+  sticker: Sticker;
+  onMove: (id: string, x: number, y: number) => void;
+  onDelete: (id: string) => void;
+  drawMode: DrawMode;
+}) {
+  const f = FOOTBALL_STICKER;
+  return (
+    <Group
+      x={sticker.x}
+      y={sticker.y}
+      rotation={sticker.rotation ?? f.rotation}
+      draggable
+      onDragEnd={(e) => onMove(sticker.id, e.target.x(), e.target.y())}
+      onDblClick={() => onDelete(sticker.id)}
+      onTap={() => onDelete(sticker.id)}
+      onMouseDown={(e) => { e.cancelBubble = true; }}
+      onTouchStart={(e) => { e.cancelBubble = true; }}
+      onMouseEnter={(e) => {
+        const container = e.target.getStage()?.container();
+        if (container) container.style.cursor = "grab";
+      }}
+      onMouseLeave={(e) => {
+        const container = e.target.getStage()?.container();
+        if (container) container.style.cursor = drawMode === 'free' ? 'crosshair' : 'alias';
+      }}
+    >
+      <Ellipse
+        radiusX={f.rx}
+        radiusY={f.ry}
+        fill={f.body}
+        stroke={f.outline}
+        strokeWidth={f.strokeWidth}
+        shadowColor="#000"
+        shadowBlur={4}
+        shadowOpacity={0.25}
+        shadowOffsetY={2}
+      />
+      <Line
+        points={[-f.seamHalfLength, 0, f.seamHalfLength, 0]}
+        stroke={f.seam}
+        strokeWidth={2.5}
+        lineCap="round"
+        listening={false}
+      />
+      {f.laceXs.map((x) => (
+        <Line
+          key={x}
+          points={[x, -f.laceY, x, f.laceY]}
+          stroke={f.seam}
+          strokeWidth={2}
+          lineCap="round"
+          listening={false}
+        />
+      ))}
+    </Group>
+  );
+}
+
 const PlayCanvas = ({
   players,
   routes,
+  stickers = [],
   setRoutes,
   setPlayers,
+  setStickers,
   stageRef,
   onDeleteRoute,
+  onDeleteSticker,
   drawMode = 'free',
   hasArrow = true,
   isDashed = false
 }: PlayCanvasProps) => {
-  // 20 yards total, one line every 5 yards (4 gaps x 100px)
-  const YARD_LINES = [
-    { y: 50, label: "20" },
-    { y: 150, label: "15" },
-    { y: 250, label: "10" },
-    { y: 350, label: "5" },
-    { y: 450, label: "0" },
-  ];
+  // Live snap guides while dragging players (x for vertical, y for horizontal)
+  const [snapGuides, setSnapGuides] = useState<{ v: number | null; h: number | null }>({ v: null, h: null });
 
   const [isDrawing, setIsDrawing] = useState(false);
   const [currentLine, setCurrentLine] = useState<number[]>([]);
@@ -404,11 +473,45 @@ const PlayCanvas = ({
     }
   };
 
+  // Snap guides while dragging a player: pull it onto the LOS and onto other
+  // players' alignment (closest match within SNAP_RADIUS wins) so formations
+  // stay consistent play to play.
+  const handleDragMove = (e: any, id: string) => {
+    const node = e.target;
+    const x = node.x();
+    const y = node.y();
+
+    let bestY = LOS_Y;
+    let dy = Math.abs(y - LOS_Y);
+    let bestX: number | null = null;
+    let dx = SNAP_RADIUS + 1;
+    for (const p of players) {
+      if (p.id === id) continue;
+      const pdy = Math.abs(y - p.y);
+      if (pdy < dy) { dy = pdy; bestY = p.y; }
+      const pdx = Math.abs(x - p.x);
+      if (pdx < dx) { dx = pdx; bestX = p.x; }
+    }
+
+    const snapY = dy <= SNAP_RADIUS ? bestY : y;
+    const snapX = bestX !== null && dx <= SNAP_RADIUS ? bestX : x;
+    node.position({ x: snapX, y: snapY });
+
+    const v = bestX !== null && dx <= SNAP_RADIUS ? bestX : null;
+    const h = dy <= SNAP_RADIUS ? bestY : null;
+    setSnapGuides((prev) => (prev.v === v && prev.h === h ? prev : { v, h }));
+  };
+
   const handleDragEnd = (e: any, id: string) => {
     const newPlayers = players.map((p) =>
       p.id === id ? { ...p, x: e.target.x(), y: e.target.y() } : p
     );
     setPlayers(newPlayers);
+    setSnapGuides({ v: null, h: null });
+  };
+
+  const handleStickerMove = (id: string, x: number, y: number) => {
+    setStickers(stickers.map((s) => (s.id === id ? { ...s, x, y } : s)));
   };
 
   const previewTension = drawMode === 'straight' ? 0 : drawMode === 'curve' ? 0.3 : 0.5;
@@ -427,8 +530,8 @@ const PlayCanvas = ({
         </button>
       )}
       <Stage
-        width={800}
-        height={500}
+        width={FIELD_W}
+        height={FIELD_H}
         ref={stageRef}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
@@ -438,34 +541,9 @@ const PlayCanvas = ({
         onTouchEnd={handleMouseUp}
         onContextMenu={(e) => e.evt.preventDefault()}
       >
-        {/* Yard lines background - non-interactive so drawing still works */}
+        {/* Line of scrimmage — the single reference line for every play */}
         <Layer listening={false}>
-          {YARD_LINES.map((line) => (
-            <React.Fragment key={line.y}>
-              <Line
-                points={[0, line.y, 800, line.y]}
-                stroke="#94a3b8"
-                strokeWidth={2}
-                opacity={0.7}
-              />
-              <Text
-                x={8}
-                y={line.y - 18}
-                text={line.label}
-                fontSize={12}
-                fontStyle="bold"
-                fill="#64748b"
-              />
-              <Text
-                x={778}
-                y={line.y - 18}
-                text={line.label}
-                fontSize={12}
-                fontStyle="bold"
-                fill="#64748b"
-              />
-            </React.Fragment>
-          ))}
+          <Line points={[0, LOS_Y, FIELD_W, LOS_Y]} stroke="#64748b" strokeWidth={2.5} />
         </Layer>
         <Layer>
           {routes.map((route) => (
@@ -548,6 +626,7 @@ const PlayCanvas = ({
                 strokeWidth={2}
                 draggable
                 onDragEnd={(e) => handleDragEnd(e, player.id)}
+                onDragMove={(e) => handleDragMove(e, player.id)}
                 onMouseDown={(e) => e.cancelBubble = true}
                 onTouchStart={(e) => e.cancelBubble = true}
                 onMouseEnter={(e) => {
@@ -570,6 +649,42 @@ const PlayCanvas = ({
               />
             </React.Fragment>
           ))}
+
+          {stickers.map((sticker) => (
+            <FootballStickerNode
+              key={sticker.id}
+              sticker={sticker}
+              onMove={handleStickerMove}
+              onDelete={onDeleteSticker}
+              drawMode={drawMode}
+            />
+          ))}
+        </Layer>
+
+        {/* Visual helpers: snap guides while dragging players + a live
+            route-depth badge (yards past the LOS) while drawing */}
+        <Layer listening={false}>
+          {snapGuides.v !== null && (
+            <Line points={[snapGuides.v, 0, snapGuides.v, FIELD_H]} stroke="#2563eb" strokeWidth={1.5} dash={[6, 6]} opacity={0.85} />
+          )}
+          {snapGuides.h !== null && (
+            <Line points={[0, snapGuides.h, FIELD_W, snapGuides.h]} stroke="#2563eb" strokeWidth={1.5} dash={[6, 6]} opacity={0.85} />
+          )}
+          {isDrawing && currentLine.length >= 2 && (() => {
+            const ex = currentLine[currentLine.length - 2];
+            const ey = currentLine[currentLine.length - 1];
+            const yards = Math.round((LOS_Y - ey) / PX_PER_YARD);
+            const label = `${yards} yd${Math.abs(yards) === 1 ? "" : "s"}`;
+            const badgeW = label.length * 8 + 14;
+            const badgeX = Math.min(ex + 16, FIELD_W - badgeW - 4);
+            const badgeY = Math.max(4, ey - 30);
+            return (
+              <Group x={badgeX} y={badgeY}>
+                <Rect width={badgeW} height={20} fill="#111827" opacity={0.85} cornerRadius={4} />
+                <Text x={7} y={3} text={label} fontSize={13} fontStyle="bold" fill="#fff" />
+              </Group>
+            );
+          })()}
         </Layer>
       </Stage>
     </div>
